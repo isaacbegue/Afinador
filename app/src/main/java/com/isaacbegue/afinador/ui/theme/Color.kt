@@ -2,18 +2,20 @@ package com.isaacbegue.afinador.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Paleta Oscura
-val DarkBackground = Color(0xFF121212) // Fondo principal muy oscuro
-val DarkSurface = Color(0xFF1E1E1E)    // Superficies ligeramente más claras (cards, etc.)
-val DarkPrimary = Color(0xFFBB86FC)    // Color primario (acentos principales, botones activos)
-val DarkPrimaryVariant = Color(0xFF3700B3) // Variante más oscura del primario
-val DarkSecondary = Color(0xFF03DAC6)    // Color secundario (acentos flotantes, progreso)
-val DarkOnBackground = Color(0xFFE0E0E0) // Texto/iconos sobre fondo oscuro
-val DarkOnSurface = Color(0xFFE0E0E0)  // Texto/iconos sobre superficies oscuras
-val DarkOnError = Color(0xFF000000)    // Texto/iconos sobre errores
-val DarkError = Color(0xFFCF6679)      // Color para errores
+// Nueva Paleta Oscura Basada en el Logo
+val DarkBackground = Color(0xFF212121) // Gris oscuro (similar al icono/contorno del logo)
+val DarkSurface = Color(0xFF303030)    // Gris ligeramente más claro para elevación
+val DarkPrimary = Color(0xFFA8C945)    // Verde lima del fondo del logo
+val DarkPrimaryVariant = Color(0xFF8BA83B) // Verde lima ligeramente más oscuro
+val DarkSecondary = Color(0xFFA8C945)    // Reutilizamos el primario para simplicidad
+val DarkOnBackground = Color(0xFFE0E0E0) // Texto/iconos claros sobre fondo oscuro
+val DarkOnSurface = Color(0xFFE0E0E0)  // Texto/iconos claros sobre superficie oscura
+val DarkOnPrimary = Color(0xFF212121)    // Texto/iconos oscuros sobre fondo primario (verde)
+val DarkError = Color(0xFFCF6679)      // Color para errores (mantenido)
+val DarkOnError = Color(0xFF000000)    // Texto/iconos sobre errores (mantenido)
 
-// Colores adicionales (opcional, para elementos específicos del afinador)
+
+// Colores funcionales para el afinador (mantenidos)
 val TunerGreen = Color(0xFF4CAF50)     // Verde para indicar afinación correcta
 val TunerYellow = Color(0xFFFFEB3B)    // Amarillo para indicar cercanía
 val TunerRed = Color(0xFFF44336)       // Rojo para indicar desafinación
