@@ -38,7 +38,8 @@ import kotlin.math.roundToInt
 
 // --- Constants ---
 private const val SAMPLE_RATE = 44100
-private const val BUFFER_SIZE = 1024
+// Increased buffer size for better low-frequency detection
+private const val BUFFER_SIZE = 2048 // Adjusted from 1024
 private const val MIN_VALID_FREQUENCY = 20.0f
 private const val CENTS_IN_TUNE_THRESHOLD = 10.0f
 private const val CENTS_RANGE_FOR_VISUALIZER = 50.0f // Visual range +/- 50 cents
@@ -153,6 +154,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
         startJob = viewModelScope.launch(Dispatchers.IO) {
             Log.i("TunerViewModel", "[IO Thread] Requesting to start native audio engine...")
             setA4Native(_uiState.value.a4Frequency)
+            // Pass the updated BUFFER_SIZE constant here
             val started = try {
                 startNativeAudioEngine(SAMPLE_RATE, BUFFER_SIZE)
             } catch (e: Throwable) {
@@ -190,6 +192,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
 
         if (!_uiState.value.isRecording) {
             Log.w("TunerViewModel", "Stop ignored: Engine not recording.")
+            // Still attempt to stop native engine just in case it's in a weird state
             viewModelScope.launch(Dispatchers.IO) { tryStopNativeEngine() }
             return
         }
@@ -218,6 +221,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
         val clampedFreq = newFreq.coerceIn(400.0f, 500.0f)
         if (abs(clampedFreq - _uiState.value.a4Frequency) > 0.01f) {
             _uiState.update { it.copy(a4Frequency = clampedFreq) }
+            // Update native engine only if it's running or starting
             if (_uiState.value.isRecording || startJob?.isActive == true) {
                 setA4Native(clampedFreq)
             }
@@ -230,10 +234,11 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update {
                 it.copy(
                     targetPitch = newTarget,
-                    isTuned = false,
-                    centsOffset = 0.0f
+                    isTuned = false, // Reset tuned status on target change
+                    centsOffset = 0.0f // Reset offset display
                 )
             }
+            // Reset display immediately when target changes manually
             cancelNoDetectionTimer()
             resetDetectionState(keepTarget = true)
         }
@@ -309,20 +314,16 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
         val offsetAvailable = abs(centsOffsetVsDetectedChromatic - CENTS_NOT_AVAILABLE) > 1e-5
 
         viewModelScope.launch(Dispatchers.Main) {
-            // *** ADDED LOG: Check state target at coroutine start ***
-            val stateTargetPitchAtStart = _uiState.value.targetPitch
-            Log.d("TunerViewModel_Chromatic", "Entering onNativeResult. State Target Pitch: $stateTargetPitchAtStart")
-
+            val stateAtStart = _uiState.value // Capture state at coroutine start for consistency
 
             // --- Auto-Select Target Pitch for Instrument Modes ---
-            val currentModeName = _uiState.value.selectedTuningModeName
-            val currentTuning = Tunings.ALL_TUNINGS.find { it.name == currentModeName }
+            val currentTuning = Tunings.ALL_TUNINGS.find { it.name == stateAtStart.selectedTuningModeName }
             val isInstrumentModeAutoSelect = currentTuning != null &&
-                    currentModeName != CHROMATIC_MODE_NAME &&
-                    currentModeName != FREE_SINGING_MODE_NAME
+                    stateAtStart.selectedTuningModeName != CHROMATIC_MODE_NAME &&
+                    stateAtStart.selectedTuningModeName != FREE_SINGING_MODE_NAME
 
             // Use the state's target pitch captured at the start for consistency within this execution
-            var autoSelectedTarget: Pitch? = stateTargetPitchAtStart
+            var targetForCalculation: Pitch? = stateAtStart.targetPitch
 
             if (isInstrumentModeAutoSelect && currentFrameMidiNote != null && currentTuning != null) {
                 var closestPitch: Pitch? = null
@@ -341,61 +342,42 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                if (minSemitoneDiff <= AUTO_SELECT_SEMITONE_THRESHOLD && closestPitch != stateTargetPitchAtStart) {
+                // Auto-select if close enough and different from current target
+                if (minSemitoneDiff <= AUTO_SELECT_SEMITONE_THRESHOLD && closestPitch != stateAtStart.targetPitch) {
                     Log.d("TunerViewModel", "Auto-selecting target: $closestPitch (Detected MIDI: ${currentFrameMidiNote}, String MIDI: ${getMidiNoteFromPitch(closestPitch!!)}, Diff: $minSemitoneDiff)")
-                    autoSelectedTarget = closestPitch
+                    targetForCalculation = closestPitch
                     // Only update the state's target pitch here if it changed via auto-select
-                    if (_uiState.value.targetPitch != autoSelectedTarget) {
-                        _uiState.update { it.copy(targetPitch = autoSelectedTarget) }
+                    if (stateAtStart.targetPitch != targetForCalculation) {
+                        _uiState.update { it.copy(targetPitch = targetForCalculation) }
                     }
-                } else {
-                    // If no auto-select happened, ensure autoSelectedTarget still holds the original state target
-                    autoSelectedTarget = stateTargetPitchAtStart
                 }
             }
             // --- End Auto-Select ---
 
             val noteDetected = currentFrameMidiNote != null
-            cancelNoDetectionTimer()
+            cancelNoDetectionTimer() // Cancel any pending reset timer
 
             if (noteDetected && offsetAvailable) {
                 val detectedPitch = getPitchFromMidiNote(currentFrameMidiNote!!)!!
-                val a4 = _uiState.value.a4Frequency
+                val a4 = stateAtStart.a4Frequency
                 val detectedExactFreq = calculateFrequency(detectedPitch, a4) * TWELFTH_ROOT_OF_TWO.pow(centsOffsetVsDetectedChromatic / 100f)
 
                 var finalNoteName: String? = detectedPitch.noteName
                 var finalOctave: Int? = detectedPitch.octave
                 var rangeIndicator: String? = null
-                var finalCentsOffset = centsOffsetVsDetectedChromatic
-                var valueForHistory = centsOffsetVsDetectedChromatic
+                var finalCentsOffset = centsOffsetVsDetectedChromatic // Default for Canto mode
+                var valueForHistory = centsOffsetVsDetectedChromatic  // Default for Canto mode
 
-                // Use the potentially auto-selected target (or original state target) for calculation
-                val targetForCalculation = autoSelectedTarget
-                val isDynamicCentering = _uiState.value.isGraphCenteringDynamic
-                val isChromaticMode = currentModeName == CHROMATIC_MODE_NAME // Explicit check for logging
-
-                if (isChromaticMode) {
-                    Log.d("TunerViewModel_Chromatic", "--- Chromatic Mode Check ---")
-                    Log.d("TunerViewModel_Chromatic", "isDynamicCentering: $isDynamicCentering")
-                    Log.d("TunerViewModel_Chromatic", "Detected Pitch: $detectedPitch ($currentFrameMidiNote)")
-                    // Log the target actually being USED for calculation
-                    Log.d("TunerViewModel_Chromatic", "Target For Calculation: $targetForCalculation")
-                    Log.d("TunerViewModel_Chromatic", "Initial cents vs Detected: $centsOffsetVsDetectedChromatic")
-                }
-
-                if (!isDynamicCentering && targetForCalculation != null) {
-                    // This block runs for Instrument and Chromatic modes
+                // Recalculate offset relative to target for Instrument/Chromatic modes
+                if (!stateAtStart.isGraphCenteringDynamic && targetForCalculation != null) {
                     val targetMidiNote = getMidiNoteFromPitch(targetForCalculation)
                     val targetFreq = calculateFrequency(targetForCalculation, a4)
 
                     if (targetMidiNote != null && targetFreq > 1e-6f && detectedExactFreq > 1e-6f) {
                         finalCentsOffset = 1200.0f * log2(detectedExactFreq / targetFreq)
-                        valueForHistory = finalCentsOffset
+                        valueForHistory = finalCentsOffset // Use offset vs target for history in these modes
 
-                        if (isChromaticMode) {
-                            Log.d("TunerViewModel_Chromatic", "Calculated Offset vs Target ($targetForCalculation): $finalCentsOffset")
-                        }
-
+                        // Adjust displayed note if too far from target (Instrument/Chromatic only)
                         val deltaSemitones = currentFrameMidiNote - targetMidiNote
                         when {
                             deltaSemitones > DISPLAY_NOTE_BOUNDARY_SEMITONES -> {
@@ -407,37 +389,27 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                                 finalNoteName = boundaryPitch?.noteName; finalOctave = boundaryPitch?.octave; rangeIndicator = "-"
                             }
                             else -> {
+                                // Display the actually detected note if within range
                                 finalNoteName = detectedPitch.noteName; finalOctave = detectedPitch.octave; rangeIndicator = null
                             }
                         }
                     } else {
-                        // Fallback
+                        // Fallback if target frequency calculation fails (shouldn't happen often)
+                        Log.w("TunerViewModel", "WARN: Fallback offset calculation used for non-dynamic mode!")
                         finalCentsOffset = centsOffsetVsDetectedChromatic
                         valueForHistory = centsOffsetVsDetectedChromatic
-                        if (isChromaticMode) {
-                            Log.w("TunerViewModel_Chromatic", "WARN: Fallback offset calculation used!")
-                        }
                     }
-                } else if (isChromaticMode) {
-                    // Log if we skipped the calculation block in Chromatic Mode (target was null)
-                    Log.e("TunerViewModel_Chromatic", "ERROR: Skipped offset calculation block! Target was null. DynamicCentering=$isDynamicCentering")
-                    finalCentsOffset = centsOffsetVsDetectedChromatic
-                    valueForHistory = centsOffsetVsDetectedChromatic
                 }
 
                 val normalizedValueForHistory = (valueForHistory / CENTS_RANGE_FOR_VISUALIZER).coerceIn(-1.0f, 1.0f)
                 addHistoryPoint(normalizedValueForHistory, currentTime)
                 val isTuned = abs(finalCentsOffset) <= CENTS_IN_TUNE_THRESHOLD
 
-                if (isChromaticMode) {
-                    Log.d("TunerViewModel_Chromatic", "Final State Update: Note=$finalNoteName$finalOctave, Offset=$finalCentsOffset, HistoryVal=$valueForHistory, Tuned=$isTuned")
-                    Log.d("TunerViewModel_Chromatic", "--- End Chromatic Check ---")
-                }
-
-                // Update the UI state, ensuring targetPitch reflects the one used for calculation
+                // Update the UI state based on calculated values
                 _uiState.update {
+                    // Use the potentially auto-updated target from earlier logic
                     it.copy(
-                        targetPitch = targetForCalculation, // Reflect the target used (potentially auto-selected or original state)
+                        targetPitch = targetForCalculation,
                         displayedNoteName = finalNoteName,
                         displayedOctave = finalOctave,
                         outsideRangeIndicator = rangeIndicator,
@@ -447,10 +419,11 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
-            } else { // No valid detection or offset wasn't available
-                startNoDetectionTimer()
-                addHistoryPoint(null, currentTime)
-                if (_uiState.value.isNoteDetected) {
+            } else { // No valid detection or offset wasn't available from native code
+                startNoDetectionTimer() // Start timer to potentially clear display
+                addHistoryPoint(null, currentTime) // Add gap to history
+                // Only update if state was previously showing detection
+                if (stateAtStart.isNoteDetected) {
                     _uiState.update { it.copy(isNoteDetected = false, isTuned = false) }
                 }
             }
@@ -463,6 +436,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
     private fun addHistoryPoint(normalizedValue: Float?, timestamp: Long) {
         _uiState.update { currentState ->
             val updatedHistory = currentState.tuningHistory + (timestamp to normalizedValue)
+            // Filter history to keep only points within the duration window
             val filteredHistory = updatedHistory.filter { (ts, _) ->
                 timestamp - ts <= HISTORY_DURATION_MS
             }
@@ -471,11 +445,13 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startNoDetectionTimer() {
-        cancelNoDetectionTimer()
+        cancelNoDetectionTimer() // Ensure only one timer runs
         noDetectionJob = viewModelScope.launch(Dispatchers.Main) {
             delay(NO_DETECTION_TIMEOUT_MS)
+            // Check isActive and if still no detection when timer finishes
             if (isActive && !_uiState.value.isNoteDetected) {
                 Log.d("TunerViewModel", "No detection timeout reached. Clearing display.")
+                // Clear display fields, keep target pitch
                 _uiState.update {
                     it.copy(
                         displayedNoteName = null,
@@ -487,7 +463,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-            noDetectionJob = null
+            noDetectionJob = null // Mark timer as complete
         }
     }
 
@@ -511,31 +487,35 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                 centsOffset = 0.0f,
                 isNoteDetected = false,
                 isTuned = false,
-                tuningHistory = emptyList()
+                tuningHistory = emptyList() // Clear history as well
             )
         }
-        cancelNoDetectionTimer()
+        cancelNoDetectionTimer() // Cancel any pending reset timer
     }
 
     // --- Utility Functions ---
     private fun calculateFrequency(pitch: Pitch, a4Freq: Float): Float {
-        val noteIndex = STANDARD_NOTES.indexOf(pitch.noteName)
-        if (noteIndex == -1) return 0.0f
         val midiNote = getMidiNoteFromPitch(pitch) ?: return 0.0f
         return a4Freq * 2.0f.pow((midiNote - MIDI_NOTE_A4) / 12.0f)
     }
 
     private fun getMidiNoteFromPitch(pitch: Pitch): Int? {
         val noteIndex = STANDARD_NOTES.indexOf(pitch.noteName)
-        if (noteIndex == -1) return null
+        if (noteIndex == -1 || pitch.octave !in OCTAVE_RANGE) return null
+        // MIDI note calculation: index + (octave + 1) * 12
+        // Example: C0 -> 0 + (0+1)*12 = 12
+        // Example: A4 -> 9 + (4+1)*12 = 69
         return noteIndex + (pitch.octave + 1) * 12
     }
 
     private fun getPitchFromMidiNote(midiNote: Int): Pitch? {
-        if (midiNote < 0) return null
+        if (midiNote < 12) return null // MIDI notes below C0 are uncommon for tuning
         val noteIndex = midiNote % 12
-        val octave = (midiNote / 12) - 1
-        if (octave !in OCTAVE_RANGE) return null
+        val octave = (midiNote / 12) - 1 // Convert MIDI octave to standard scientific pitch notation octave
+        if (octave !in OCTAVE_RANGE) {
+            Log.w("TunerViewModel", "Calculated octave $octave from MIDI $midiNote is outside valid range $OCTAVE_RANGE")
+            return null
+        }
         return Pitch(STANDARD_NOTES[noteIndex], octave)
     }
 
@@ -552,6 +532,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
                 Log.i("TunerViewModel", "Native library 'afinador_native' loaded successfully.")
             } catch (e: UnsatisfiedLinkError) {
                 Log.e("TunerViewModel", "FATAL: Error loading native library 'afinador_native'", e)
+                // Consider adding mechanisms to inform the user or disable functionality
             } catch (t: Throwable) {
                 Log.e("TunerViewModel", "FATAL: Unexpected error loading native library", t)
             }
@@ -562,7 +543,7 @@ class TunerViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         Log.i("TunerViewModel", "ViewModel cleared. Stopping audio processing.")
-        stopAudioProcessing()
-        cancelNoDetectionTimer()
+        stopAudioProcessing() // Ensure native engine is stopped
+        cancelNoDetectionTimer() // Clean up any running timers
     }
 }
